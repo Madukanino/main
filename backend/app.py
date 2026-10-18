@@ -44,6 +44,7 @@ from errors import (
     OVERSIZED_INPUT,
     PAYLOAD_TOO_LARGE,
     RATE_LIMITED,
+    UNSUPPORTED_INPUT,
     UNSUPPORTED_MEDIA_TYPE,
     VALIDATION_ERROR,
     classify_cli_error,
@@ -100,6 +101,11 @@ from metadata_errors import (
 from schema import discover_schemas, resolve_schema, validate_selective_disclosure_input
 from verification_receipt import build_verification_receipt
 from stego import canonical_metadata_hash, embed_metadata, extract_metadata, sha256_file
+from capture_attestation import (
+    canonical_attestation_hash,
+    decode_attestation,
+    verify_device_commitment,
+)
 from c2pa import (
     C2paParseError,
     C2paTrustStatus,
@@ -1846,6 +1852,115 @@ def create_app() -> Flask:
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 400
         return jsonify(response)
+
+    @app.post("/api/capture-attestation/verify")
+    @limiter.limit(config.ratelimit_verify)
+    def verify_capture_attestation():
+        if _enforce_json_size() > config.max_json_bytes:
+            return jsonify({"error": "JSON payload exceeds size limit"}), 413
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="JSON body is required",
+                status=400,
+                cli_code=MALFORMED_INPUT,
+            )
+
+        if "attestation" not in payload or payload["attestation"] is None:
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="attestation is required",
+                status=400,
+                cli_code=MALFORMED_INPUT,
+            )
+
+        attestation_raw = payload["attestation"]
+        if not isinstance(attestation_raw, dict):
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="attestation must be a JSON object",
+                status=400,
+                cli_code=MALFORMED_INPUT,
+            )
+
+        evidence_digest = payload.get("evidence_digest")
+        if evidence_digest is None:
+            evidence_digest = payload.get("evidenceDigest")
+
+        if evidence_digest is None:
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="evidence_digest is required",
+                status=400,
+                cli_code=MALFORMED_INPUT,
+            )
+
+        if not is_hex_32(evidence_digest):
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="evidence_digest must be a 32-byte hex string",
+                status=400,
+                cli_code=MALFORMED_INPUT,
+            )
+
+        device_key = payload.get("device_key")
+        if device_key is None:
+            device_key = payload.get("deviceKey")
+
+        if device_key is not None and not is_hex_32(device_key):
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="device_key must be a 32-byte hex string",
+                status=400,
+                cli_code=MALFORMED_INPUT,
+            )
+
+        try:
+            decoded = decode_attestation(attestation_raw)
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="malformed attestation payload",
+                status=400,
+                cli_code=MALFORMED_INPUT,
+            )
+
+        try:
+            attestation_hash = canonical_attestation_hash(decoded)
+        except (ValueError, TypeError):
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="malformed attestation payload",
+                status=400,
+                cli_code=MALFORMED_INPUT,
+            )
+
+        evidence_binding_valid = (
+            decoded.evidence_digest_binding.lower() == evidence_digest.lower()
+        )
+        checks: dict[str, bool] = {
+            "evidence_binding": evidence_binding_valid,
+        }
+
+        if device_key is not None:
+            try:
+                checks["device_commitment"] = verify_device_commitment(
+                    decoded, bytes.fromhex(device_key)
+                )
+            except (ValueError, TypeError):
+                checks["device_commitment"] = False
+
+        valid = all(checks.values())
+
+        return ok_response(
+            {
+                "valid": valid,
+                "attestation_hash": attestation_hash,
+                "checks": checks,
+            }
+        )
 
     # -----------------------------------------------------------------------
     # C2PA interoperability
