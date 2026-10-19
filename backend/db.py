@@ -1139,3 +1139,80 @@ def fail_job(job_id: int, error: str, *, is_fatal: bool = False) -> None:
     else:
         job["status"] = "pending"
         job.pop("worker_id", None)
+
+
+def get_job_queue_metrics() -> dict[str, Any]:
+    """Return counts per job type and state plus the age of the oldest queued job.
+
+    Cheap aggregate query grouped by type and status, utilizing the jobs index.
+    Skips gracefully (returns empty data) when no database is configured or
+    when the database query fails.
+
+    Returns:
+        dict with:
+            "counts": {(type, state): count, ...}
+            "oldest_queued_seconds": {type: seconds, ...}
+    """
+    if not database_url():
+        return {"counts": {}, "oldest_queued_seconds": {}}
+
+    try:
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        type,
+                        status AS state,
+                        COUNT(*) AS count,
+                        EXTRACT(EPOCH FROM (NOW() - MIN(created_at))) FILTER (WHERE status = 'pending') AS oldest_queued_seconds
+                    FROM jobs
+                    GROUP BY type, status;
+                    """
+                )
+                rows = cursor.fetchall()
+    except Exception as exc:
+        logger.warning("Failed to query job queue metrics: %s", exc)
+        return {"counts": {}, "oldest_queued_seconds": {}}
+
+    counts: dict[tuple[str, str], int] = {}
+    oldest_queued: dict[str, float] = {}
+
+    for row in rows:
+        if isinstance(row, dict):
+            j_type = str(row.get("type", ""))
+            state = str(row.get("state") or row.get("status", ""))
+            cnt = int(row.get("count", 0))
+            oldest_sec = row.get("oldest_queued_seconds")
+        elif hasattr(row, "__getitem__"):
+            try:
+                j_type = str(row["type"])
+                state = str(row["state"] if "state" in row else row["status"])
+                cnt = int(row["count"])
+                oldest_sec = row.get("oldest_queued_seconds") if hasattr(row, "get") else row["oldest_queued_seconds"]
+            except (KeyError, TypeError):
+                j_type = str(row[0])
+                state = str(row[1])
+                cnt = int(row[2])
+                oldest_sec = row[3] if len(row) > 3 else None
+        else:
+            continue
+
+        if not j_type or not state:
+            continue
+
+        counts[(j_type, state)] = cnt
+        if oldest_sec is not None:
+            oldest_queued[j_type] = max(0.0, float(oldest_sec))
+
+    for j_type, _ in counts:
+        if j_type not in oldest_queued:
+            oldest_queued[j_type] = 0.0
+
+    return {
+        "counts": counts,
+        "oldest_queued_seconds": oldest_queued,
+    }
+
+
+get_job_metrics = get_job_queue_metrics
