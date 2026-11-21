@@ -419,3 +419,10 @@ python -m unittest test_app.py test_stego.py test_registration_reconcile.py
 The service uses temporary files while processing and does not persist uploaded
 source videos.
 
+
+## Registration Idempotency
+
+`POST /api/proofs/register` enforces idempotency at both the request layer (`idempotency.py`) and the persistence layer (`db.upsert_register_event`):
+
+- The canonical idempotency binding includes the HTTP method, path, query string, identity `tier` (`silent`, `source`, or `seal`), and raw request body.
+- When an explicit `Idempotency-Key` header is supplied, the key is bound to the canonical digest and identity tier. Replaying the same key with the same payload replays the stored response; reusing the key with a changed identity tier returns `409 Conflict` (`{"error": "idempotency key reused with conflicting payload", "conflict_field": "tier"}`) without invoking the handler or enqueueing another `verify_tx` registration job.
