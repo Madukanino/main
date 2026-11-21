@@ -21,6 +21,15 @@ from db import Jsonb, get_connection
 #   response_payload JSONB NULL
 #   error_payload JSONB NULL
 #   UNIQUE (request_digest, request_type)
+#
+# Race model (deterministic fixtures in tests/test_registration_races.py):
+#   * Duplicate submissions converge on a single PENDING/COMPLETED record via
+#     the UNIQUE constraint; losers replay the winner's stored outcome.
+#   * A worker that dies while holding PENDING leaves the record in place.
+#     Once ``expires_at`` passes, the stale PENDING lock is reclaimed by the
+#     next caller so a replacement worker can proceed exactly once.
+#   * Only one caller may transition a reclaimed record back to PENDING; the
+#     reclaim is a conditional UPDATE, so concurrent reclaimers cannot both win.
 
 
 def _now() -> datetime.datetime:
@@ -47,9 +56,13 @@ def create_idempotency_record(
     """Insert a new idempotency record with status PENDING.
 
     Returns (record_id, status). If a record already exists, returns its id and current status.
+    A stale PENDING record whose lock has expired is reclaimed for this caller
+    (status returned as PENDING with the reclaimed id), so a replacement worker
+    can retry after the original worker vanished.
     """
     if expires_at is None:
         expires_at = _default_expiry()
+    now = _now()
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -62,8 +75,27 @@ def create_idempotency_record(
                 (request_digest, request_type, expires_at),
             )
             row = cur.fetchone()
+            record_id, status = int(row["id"]), row["status"]
+
+            if status == "PENDING":
+                # Reclaim only if the existing lock is stale. Conditional UPDATE
+                # ensures at most one replacement worker wins the reclaim.
+                cur.execute(
+                    """
+                    UPDATE idempotency_records
+                    SET expires_at = %s
+                    WHERE id = %s AND status = 'PENDING' AND expires_at <= %s
+                    RETURNING id;
+                    """,
+                    (expires_at, record_id, now),
+                )
+                reclaimed = cur.fetchone()
+                if reclaimed is not None:
+                    conn.commit()
+                    return record_id, "PENDING"
+
             conn.commit()
-            return int(row["id"]), row["status"]
+            return record_id, status
 
 
 def get_idempotency_record(request_digest: str, request_type: str) -> Optional[dict]:
