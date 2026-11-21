@@ -249,6 +249,24 @@ Output never includes connection strings or secrets: every line is scrubbed of
 the `DATABASE_URL` value, URL credentials, and `password=`/`token=`-style
 values, and unexpected exceptions are reported by type name only.
 
+## Index Rebuild Dry-Run
+
+The chain indexer can reconstruct a temporary projection from synthetic events
+and report differences against the live index without replacing it. The dry-run
+is read-only with respect to the live index: it writes only to a temporary
+state directory that is removed after the run.
+
+Each projection carries a deterministic fingerprint: a SHA-256 digest over a
+canonical, sorted encoding of the projected records. Identical event inputs
+always yield identical fingerprints, so the live and rebuilt projections can be
+compared by digest alone. Differences are reported per record key with the
+fingerprint of each side; no raw evidence, media, or secrets are included in
+the report.
+
+Rollback: the dry-run stores no new durable evidence and changes no schema.
+Removing the dry-run entry point and its focused coverage restores the previous
+behaviour. Temporary state directories are deleted automatically.
+
 ## Privacy-Safe Service Metrics
 
 `GET /metrics` exposes service workload, latency, status code distributions, and bounded upload-size metrics in standard Prometheus format.
@@ -419,10 +437,17 @@ python -m unittest test_app.py test_stego.py test_registration_reconcile.py
 The service uses temporary files while processing and does not persist uploaded
 source videos.
 
+## Evidence Retention Previews
+
+`evidence_storage.preview_tenant_retention(tenant_id, *, now=None, ttl_seconds=None)` returns a read-only retention preview scoped strictly to the authenticated `tenant_id`:
+
+- Reports aggregate counts (`blob_count`, `total_ref_count`, `total_size_bytes`, `eligible_for_deletion_count`, `retained_count`, `shared_blob_count`), age summaries (`oldest_age_seconds`, `newest_age_seconds`, `average_age_seconds`), and per-blob deletion eligibility (`deletion_eligible`, `deletion_ineligible_reason`).
+- Blobs still referenced by another tenant are marked ineligible (`shared_with_other_tenants`), and blobs younger than `ttl_seconds` (when provided) are marked ineligible (`within_retention_window`).
+- Privacy: other tenants' content hashes, tenant identifiers, encrypted DEKs, and all filesystem `storage_path` values are never queried or returned.
+
 ## Evidence Storage Consistency Report
 
 `evidence_storage.generate_consistency_report(storage_dir=None, *, now=None)` returns a read-only consistency report comparing `blobs` metadata, active `tenant_blob_refs` (`ref_count > 0`), and physical files under `storage_dir` (defaulting to `HARPOCRATES_STORAGE_DIR` / `storage.default_storage_dir` without creating or mutating directories):
 
 - Reports `consistent` (`bool`), aggregate `summary` counts, and itemized discrepancies: `missing_files`, `orphaned_blobs`, `orphaned_tenant_refs`, `orphaned_files`, and `size_mismatches`.
 - Strictly read-only: never modifies database rows, never deletes physical files, and never queries or returns `encrypted_dek`.
-
