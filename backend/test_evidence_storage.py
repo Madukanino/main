@@ -174,6 +174,34 @@ class FakeCursor:
             self._results = matched
             self._idx = 0
 
+        elif "select content_hash, size_bytes, storage_path from blobs" in normalized:
+            with self.connection.lock:
+                self._results = [
+                    FakeRow(
+                        content_hash=b["content_hash"],
+                        size_bytes=b["size_bytes"],
+                        storage_path=b["storage_path"],
+                    )
+                    for _, b in sorted(self.connection.blobs.items(), key=lambda item: item[0])
+                ]
+            self._idx = 0
+
+        elif "select tenant_id, content_hash, ref_count from tenant_blob_refs" in normalized:
+            with self.connection.lock:
+                rows = [
+                    FakeRow(
+                        tenant_id=ref["tenant_id"],
+                        content_hash=ref["content_hash"],
+                        ref_count=ref["ref_count"],
+                    )
+                    for ref in self.connection.tenant_refs.values()
+                    if ref["ref_count"] > 0
+                ]
+                rows.sort(key=lambda r: (r["tenant_id"], r["content_hash"]))
+                self._results = rows
+            self._idx = 0
+            self._idx = 0
+
     def fetchone(self) -> FakeRow | None:
         if self._results and self._idx < len(self._results):
             row = self._results[self._idx]
@@ -754,6 +782,187 @@ def test_preview_tenant_retention_rejects_invalid_inputs(fake_db: FakeConnection
 
     with pytest.raises(ValueError, match="ttl_seconds must be a non-negative number"):
         evidence_storage.preview_tenant_retention("tenant_a", ttl_seconds=True)
+
+
+# ---------------------------------------------------------------------------
+# Evidence storage consistency report tests
+# ---------------------------------------------------------------------------
+
+
+def test_consistency_report_clean_state(fake_db: FakeConnection, tmp_path: Path) -> None:
+    now_ts = 1_700_000_000.0
+    blob_dir = tmp_path / "aa"
+    blob_dir.mkdir()
+    blob_file = blob_dir / "blob_1.enc"
+    blob_file.write_bytes(b"encrypted-payload-1")
+
+    evidence_storage.record_blob("hash_1", b"dek_1", len(b"encrypted-payload-1"), str(blob_file))
+    evidence_storage.record_tenant_ref("tenant_a", "hash_1")
+    evidence_storage.record_tenant_ref("tenant_b", "hash_1")
+
+    report = evidence_storage.generate_consistency_report(storage_dir=tmp_path, now=now_ts)
+
+    assert report["consistent"] is True
+    assert report["storage_dir"] == str(tmp_path.resolve())
+    assert report["summary"] == {
+        "total_blobs": 1,
+        "total_tenant_refs": 2,
+        "total_physical_files": 1,
+        "missing_files_count": 0,
+        "orphaned_blobs_count": 0,
+        "orphaned_tenant_refs_count": 0,
+        "orphaned_files_count": 0,
+        "size_mismatches_count": 0,
+    }
+    assert report["missing_files"] == []
+    assert report["orphaned_blobs"] == []
+    assert report["orphaned_tenant_refs"] == []
+    assert report["orphaned_files"] == []
+    assert report["size_mismatches"] == []
+
+
+def test_consistency_report_detects_missing_and_orphaned_records_without_modifying(
+    fake_db: FakeConnection, tmp_path: Path
+) -> None:
+    now_ts = 1_700_000_000.0
+
+    # 1. Healthy blob
+    healthy_file = tmp_path / "healthy.enc"
+    healthy_file.write_bytes(b"12345")
+    evidence_storage.record_blob("hash_healthy", b"dek_h", 5, str(healthy_file))
+    evidence_storage.record_tenant_ref("tenant_a", "hash_healthy")
+
+    # 2. Missing physical file
+    missing_path = tmp_path / "missing.enc"
+    evidence_storage.record_blob("hash_missing_file", b"dek_m", 10, str(missing_path))
+    evidence_storage.record_tenant_ref("tenant_a", "hash_missing_file")
+
+    # 3. Empty storage_path
+    evidence_storage.record_blob("hash_empty_path", b"dek_e", 10, "")
+    evidence_storage.record_tenant_ref("tenant_a", "hash_empty_path")
+
+    # 4. storage_path points to a directory
+    dir_path = tmp_path / "not_a_file_dir"
+    dir_path.mkdir()
+    evidence_storage.record_blob("hash_dir_path", b"dek_d", 10, str(dir_path))
+    evidence_storage.record_tenant_ref("tenant_a", "hash_dir_path")
+
+    # 5. Orphaned blob (no active tenant refs; include a zero ref_count row to verify it is ignored)
+    orphan_blob_file = tmp_path / "orphan_blob.enc"
+    orphan_blob_file.write_bytes(b"orphan")
+    evidence_storage.record_blob("hash_orphan_blob", b"dek_o", 6, str(orphan_blob_file))
+    fake_db.tenant_refs[("tenant_zero", "hash_orphan_blob")] = {
+        "tenant_id": "tenant_zero",
+        "content_hash": "hash_orphan_blob",
+        "ref_count": 0,
+    }
+
+    # 6. Orphaned tenant reference (missing blob metadata)
+    evidence_storage.record_tenant_ref("tenant_dangling", "hash_no_blob")
+
+    # 7. Orphaned physical file (no blob metadata)
+    orphan_disk_file = tmp_path / "untracked.enc"
+    orphan_disk_file.write_bytes(b"stray-bytes")
+
+    # 8. Size mismatch
+    mismatch_file = tmp_path / "mismatch.enc"
+    mismatch_file.write_bytes(b"actual-12345")
+    evidence_storage.record_blob("hash_size_mismatch", b"dek_s", 999, str(mismatch_file))
+    evidence_storage.record_tenant_ref("tenant_a", "hash_size_mismatch")
+
+    blobs_before = dict(fake_db.blobs)
+    refs_before = dict(fake_db.tenant_refs)
+    files_before = sorted(p for p in tmp_path.rglob("*") if p.is_file())
+
+    report = evidence_storage.generate_consistency_report(storage_dir=tmp_path, now=now_ts)
+
+    assert report["consistent"] is False
+    assert report["summary"] == {
+        "total_blobs": 6,
+        "total_tenant_refs": 6,
+        "total_physical_files": 4,
+        "missing_files_count": 3,
+        "orphaned_blobs_count": 1,
+        "orphaned_tenant_refs_count": 1,
+        "orphaned_files_count": 1,
+        "size_mismatches_count": 1,
+    }
+
+    missing_by_hash = {item["content_hash"]: item for item in report["missing_files"]}
+    assert set(missing_by_hash.keys()) == {"hash_dir_path", "hash_empty_path", "hash_missing_file"}
+    assert missing_by_hash["hash_missing_file"]["reason"] == "file_not_found"
+    assert missing_by_hash["hash_empty_path"]["reason"] == "missing_storage_path"
+    assert missing_by_hash["hash_dir_path"]["reason"] == "not_a_file"
+
+    assert report["orphaned_blobs"] == [
+        {"content_hash": "hash_orphan_blob", "size_bytes": 6, "file_exists": True}
+    ]
+    assert report["orphaned_tenant_refs"] == [
+        {"tenant_id": "tenant_dangling", "content_hash": "hash_no_blob", "ref_count": 1}
+    ]
+    assert report["orphaned_files"] == [
+        {"path": str(orphan_disk_file.resolve()), "size_bytes": len(b"stray-bytes")}
+    ]
+    assert report["size_mismatches"] == [
+        {
+            "content_hash": "hash_size_mismatch",
+            "expected_size_bytes": 999,
+            "actual_size_bytes": len(b"actual-12345"),
+        }
+    ]
+
+    # Privacy: encrypted_dek must never be queried or returned
+    serialized = str(report)
+    assert "encrypted_dek" not in serialized
+    assert "dek_h" not in serialized
+    for sql, _ in fake_db.executed[-2:]:
+        assert "encrypted_dek" not in sql.lower()
+
+    # Read-only: DB state and physical files must be completely unmodified
+    assert fake_db.blobs == blobs_before
+    assert fake_db.tenant_refs == refs_before
+    assert sorted(p for p in tmp_path.rglob("*") if p.is_file()) == files_before
+    assert orphan_disk_file.exists()
+    assert orphan_blob_file.exists()
+
+
+def test_consistency_report_empty_and_nonexistent_storage_dir(
+    fake_db: FakeConnection, tmp_path: Path
+) -> None:
+    nonexistent = tmp_path / "does_not_exist_yet"
+    assert not nonexistent.exists()
+
+    empty_report = evidence_storage.generate_consistency_report(storage_dir=nonexistent)
+    assert empty_report["consistent"] is True
+    assert empty_report["summary"]["total_blobs"] == 0
+    assert empty_report["summary"]["total_physical_files"] == 0
+    # Read-only: must not create missing storage directory
+    assert not nonexistent.exists()
+
+    # When a blob points into a non-existent directory, it is reported as missing
+    evidence_storage.record_blob("hash_missing", b"dek", 4, str(nonexistent / "blob.enc"))
+    evidence_storage.record_tenant_ref("tenant_a", "hash_missing")
+
+    report = evidence_storage.generate_consistency_report(storage_dir=nonexistent)
+    assert report["consistent"] is False
+    assert report["summary"]["missing_files_count"] == 1
+    assert report["missing_files"][0]["content_hash"] == "hash_missing"
+    assert report["missing_files"][0]["reason"] == "file_not_found"
+    assert not nonexistent.exists()
+
+
+def test_consistency_report_uses_env_storage_dir_when_omitted(
+    fake_db: FakeConnection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HARPOCRATES_STORAGE_DIR", str(tmp_path))
+    orphan_file = tmp_path / "stray.enc"
+    orphan_file.write_bytes(b"abc")
+
+    report = evidence_storage.generate_consistency_report()
+    assert report["consistent"] is False
+    assert report["storage_dir"] == str(tmp_path.resolve())
+    assert report["summary"]["orphaned_files_count"] == 1
+    assert report["orphaned_files"][0]["path"] == str(orphan_file.resolve())
 
 
 class EvidenceStorageUnittestSuite(unittest.TestCase):

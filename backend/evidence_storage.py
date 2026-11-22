@@ -5,9 +5,11 @@ import logging
 import os
 import hashlib
 import re
+from pathlib import Path
 from typing import Any, Tuple
 from cryptography.fernet import Fernet
 import db
+import storage
 from storage import _parse_timestamp
 
 logger = logging.getLogger("harpocrates.evidence_storage")
@@ -298,6 +300,230 @@ def preview_tenant_retention(
         "newest_age_seconds": min(ages) if ages else None,
         "average_age_seconds": (sum(ages) / blob_count) if ages else None,
         "blobs": items,
+    }
+
+
+def _resolve_path_safe(raw_path: str | Path) -> Path:
+    path = Path(raw_path)
+    try:
+        return path.resolve()
+    except OSError:
+        return path
+
+
+def generate_consistency_report(
+    storage_dir: Path | str | None = None,
+    *,
+    now: datetime | int | float | str | None = None,
+) -> dict[str, Any]:
+    """Compare blob metadata, tenant references, and physical files without modifying evidence.
+
+    Performs read-only database queries (never selecting ``encrypted_dek``) and
+    read-only filesystem inspection to report:
+    - ``missing_files``: blob rows whose ``storage_path`` is empty, missing, or not a regular file.
+    - ``orphaned_blobs``: blob rows with no active (``ref_count > 0``) tenant references.
+    - ``orphaned_tenant_refs``: active tenant references pointing to a ``content_hash`` missing from ``blobs``.
+    - ``orphaned_files``: physical files under ``storage_dir`` not referenced by any ``blobs`` row.
+    - ``size_mismatches``: blob rows whose existing physical file size differs from ``size_bytes``.
+    """
+    now_dt = datetime.now(timezone.utc) if now is None else _parse_timestamp(now)
+
+    if storage_dir is None:
+        raw_storage_dir = os.getenv("HARPOCRATES_STORAGE_DIR", storage.default_storage_dir)
+        target_dir = _resolve_path_safe(raw_storage_dir)
+    else:
+        target_dir = _resolve_path_safe(storage_dir)
+
+    with db.get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                select content_hash, size_bytes, storage_path
+                from blobs
+                order by content_hash asc
+                """
+            )
+            blob_rows = cursor.fetchall()
+
+            cursor.execute(
+                """
+                select tenant_id, content_hash, ref_count
+                from tenant_blob_refs
+                where ref_count > 0
+                order by tenant_id asc, content_hash asc
+                """
+            )
+            ref_rows = cursor.fetchall()
+
+    blobs_by_hash: dict[str, dict[str, Any]] = {}
+    referenced_paths: set[Path] = set()
+    missing_files: list[dict[str, Any]] = []
+    size_mismatches: list[dict[str, Any]] = []
+    file_exists_by_hash: dict[str, bool] = {}
+
+    for row in blob_rows:
+        if isinstance(row, dict):
+            content_hash = row["content_hash"]
+            size_bytes = int(row["size_bytes"])
+            storage_path = row["storage_path"]
+        else:
+            content_hash, size_bytes, storage_path = row
+            size_bytes = int(size_bytes)
+
+        blobs_by_hash[content_hash] = {
+            "content_hash": content_hash,
+            "size_bytes": size_bytes,
+            "storage_path": storage_path,
+        }
+
+        if not storage_path or not isinstance(storage_path, str) or not storage_path.strip():
+            file_exists_by_hash[content_hash] = False
+            missing_files.append(
+                {
+                    "content_hash": content_hash,
+                    "storage_path": storage_path or "",
+                    "size_bytes": size_bytes,
+                    "reason": "missing_storage_path",
+                }
+            )
+            continue
+
+        resolved_blob_path = _resolve_path_safe(storage_path)
+        referenced_paths.add(resolved_blob_path)
+
+        try:
+            if not resolved_blob_path.exists():
+                file_exists_by_hash[content_hash] = False
+                missing_files.append(
+                    {
+                        "content_hash": content_hash,
+                        "storage_path": str(resolved_blob_path),
+                        "size_bytes": size_bytes,
+                        "reason": "file_not_found",
+                    }
+                )
+            elif not resolved_blob_path.is_file():
+                file_exists_by_hash[content_hash] = False
+                missing_files.append(
+                    {
+                        "content_hash": content_hash,
+                        "storage_path": str(resolved_blob_path),
+                        "size_bytes": size_bytes,
+                        "reason": "not_a_file",
+                    }
+                )
+            else:
+                file_exists_by_hash[content_hash] = True
+                actual_size = resolved_blob_path.stat().st_size
+                if actual_size != size_bytes:
+                    size_mismatches.append(
+                        {
+                            "content_hash": content_hash,
+                            "expected_size_bytes": size_bytes,
+                            "actual_size_bytes": actual_size,
+                        }
+                    )
+        except OSError:
+            file_exists_by_hash[content_hash] = False
+            missing_files.append(
+                {
+                    "content_hash": content_hash,
+                    "storage_path": str(resolved_blob_path),
+                    "size_bytes": size_bytes,
+                    "reason": "file_not_found",
+                }
+            )
+
+    referenced_hashes: set[str] = set()
+    orphaned_tenant_refs: list[dict[str, Any]] = []
+    active_ref_count = 0
+
+    for row in ref_rows:
+        if isinstance(row, dict):
+            tenant_id = row["tenant_id"]
+            content_hash = row["content_hash"]
+            ref_count = int(row["ref_count"])
+        else:
+            tenant_id, content_hash, ref_count = row
+            ref_count = int(ref_count)
+
+        if ref_count <= 0:
+            continue
+
+        active_ref_count += 1
+        referenced_hashes.add(content_hash)
+        if content_hash not in blobs_by_hash:
+            orphaned_tenant_refs.append(
+                {
+                    "tenant_id": tenant_id,
+                    "content_hash": content_hash,
+                    "ref_count": ref_count,
+                }
+            )
+
+    orphaned_blobs: list[dict[str, Any]] = []
+    for content_hash, blob in blobs_by_hash.items():
+        if content_hash not in referenced_hashes:
+            orphaned_blobs.append(
+                {
+                    "content_hash": content_hash,
+                    "size_bytes": blob["size_bytes"],
+                    "file_exists": file_exists_by_hash.get(content_hash, False),
+                }
+            )
+
+    orphaned_files: list[dict[str, Any]] = []
+    total_physical_files = 0
+    if target_dir.exists() and target_dir.is_dir():
+        for entry in sorted(target_dir.rglob("*"), key=lambda p: str(p)):
+            try:
+                if not entry.is_file():
+                    continue
+                resolved_entry = _resolve_path_safe(entry)
+                total_physical_files += 1
+                if resolved_entry not in referenced_paths:
+                    orphaned_files.append(
+                        {
+                            "path": str(resolved_entry),
+                            "size_bytes": resolved_entry.stat().st_size,
+                        }
+                    )
+            except OSError:
+                continue
+
+    missing_files.sort(key=lambda item: item["content_hash"])
+    orphaned_blobs.sort(key=lambda item: item["content_hash"])
+    orphaned_tenant_refs.sort(key=lambda item: (item["tenant_id"], item["content_hash"]))
+    orphaned_files.sort(key=lambda item: item["path"])
+    size_mismatches.sort(key=lambda item: item["content_hash"])
+
+    consistent = not (
+        missing_files
+        or orphaned_blobs
+        or orphaned_tenant_refs
+        or orphaned_files
+        or size_mismatches
+    )
+
+    return {
+        "evaluated_at": now_dt.isoformat(),
+        "storage_dir": str(target_dir),
+        "consistent": consistent,
+        "summary": {
+            "total_blobs": len(blobs_by_hash),
+            "total_tenant_refs": active_ref_count,
+            "total_physical_files": total_physical_files,
+            "missing_files_count": len(missing_files),
+            "orphaned_blobs_count": len(orphaned_blobs),
+            "orphaned_tenant_refs_count": len(orphaned_tenant_refs),
+            "orphaned_files_count": len(orphaned_files),
+            "size_mismatches_count": len(size_mismatches),
+        },
+        "missing_files": missing_files,
+        "orphaned_blobs": orphaned_blobs,
+        "orphaned_tenant_refs": orphaned_tenant_refs,
+        "orphaned_files": orphaned_files,
+        "size_mismatches": size_mismatches,
     }
 
 
